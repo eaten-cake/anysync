@@ -15,7 +15,7 @@ anysync init
 一次性配置远程仓库时，直接运行：
 
 ```bash
-anysync remote config
+anysync config
 ```
 
 该命令会交互式询问远程仓库地址、根目录、用户名和密码。用户名和密码是否需要填写，取决于远程仓库是否启用认证。
@@ -23,10 +23,10 @@ anysync remote config
 也可以只更新某一项配置：
 
 ```bash
-anysync remote config --url <webdav-url>
-anysync remote config --root <root-path>
-anysync remote config --username <username>
-anysync remote config --password
+anysync config --url <webdav-url>
+anysync config --root <root-path>
+anysync config --username <username>
+anysync config --password
 ```
 
 指定参数时，只更新对应配置，未指定的配置保持不变。

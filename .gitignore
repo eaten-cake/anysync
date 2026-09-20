@@ -16,3 +16,6 @@ desktop.ini
 .env
 .env.*
 !.env.example
+
+# anysync 仓库目录（含明文密码，绝不入库）
+.anysync/
