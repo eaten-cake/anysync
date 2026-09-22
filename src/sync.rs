@@ -1,18 +1,15 @@
+use crate::backend::{self, Backend, Entry};
 use crate::config::{self, Config};
-use crate::webdav::{Entry, WebDav};
 use anyhow::{Context, Result, bail};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
 use walkdir::WalkDir;
 
 /// 比较修改时间时的容差（秒），用于吸收不同系统间的时钟与精度差异。
 const TOLERANCE: i64 = 2;
-const VERIFY_RETRIES: usize = 3;
 const PROGRESS_WIDTH: usize = 24;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -58,11 +55,16 @@ fn scan_local(root: &Path) -> Result<Vec<Entry>> {
     Ok(entries)
 }
 
+fn is_ignored_path(path: &str) -> bool {
+    path.split('/')
+        .any(|part| part == ".anysync" || part == ".git")
+}
+
 /// 对比 src 与 dst 的文件列表，生成以 src 为源的执行计划。
 pub fn plan<'a>(src: &'a [Entry], dst: &'a [Entry]) -> Vec<(&'a Entry, Action)> {
     let dst: BTreeMap<&str, &Entry> = dst.iter().map(|e| (e.path.as_str(), e)).collect();
     src.iter()
-        .filter(|e| !e.is_dir)
+        .filter(|e| !e.is_dir && !is_ignored_path(&e.path))
         .map(|s| {
             let action = match dst.get(s.path.as_str()) {
                 None => Action::Transfer,
@@ -76,6 +78,47 @@ pub fn plan<'a>(src: &'a [Entry], dst: &'a [Entry]) -> Vec<(&'a Entry, Action)> 
         .collect()
 }
 
+pub fn status() -> Result<()> {
+    let (root, dav) = connect_repo()?;
+    let local = scan_local(&root)?;
+    let remote = dav.list_recursive()?;
+    let push_plan = plan(&local, &remote);
+    let pull_plan = plan(&remote, &local);
+
+    print_status_group("待推送", &push_plan, Action::Transfer);
+    print_status_group("待拉取", &pull_plan, Action::Transfer);
+    print_status_group("冲突", &push_plan, Action::Conflict);
+    println!(
+        "汇总：待推送 {}，待拉取 {}，冲突 {}",
+        action_count(&push_plan, Action::Transfer),
+        action_count(&pull_plan, Action::Transfer),
+        action_count(&push_plan, Action::Conflict),
+    );
+    Ok(())
+}
+
+fn print_status_group(label: &str, plan: &[(&Entry, Action)], action: Action) {
+    println!("{label}：");
+    let paths: BTreeSet<&str> = plan
+        .iter()
+        .filter(|(_, candidate)| *candidate == action)
+        .map(|(entry, _)| entry.path.as_str())
+        .collect();
+    if paths.is_empty() {
+        println!("  （无）");
+        return;
+    }
+    for path in paths {
+        println!("  {path}");
+    }
+}
+
+fn action_count(plan: &[(&Entry, Action)], action: Action) -> usize {
+    plan.iter()
+        .filter(|(_, candidate)| *candidate == action)
+        .count()
+}
+
 pub fn pull() -> Result<()> {
     let (root, dav) = connect_repo()?;
     let local = scan_local(&root)?;
@@ -84,7 +127,7 @@ pub fn pull() -> Result<()> {
     for (e, action) in plan(&remote, &local) {
         match action {
             Action::Transfer => {
-                download(&dav, &root, e)?;
+                download(dav.as_ref(), &root, e)?;
                 println!("pull      {}", e.path);
                 updated += 1;
             }
@@ -104,7 +147,7 @@ pub fn push() -> Result<()> {
     let remote = dav.list_recursive()?;
     let todo: Vec<_> = plan(&local, &remote)
         .into_iter()
-        .filter(|(_, a)| *a == Action::Transfer)
+        .filter(|(_, action)| *action == Action::Transfer)
         .collect();
     if todo.is_empty() {
         println!("push 完成：远端已是最新");
@@ -115,70 +158,77 @@ pub fn push() -> Result<()> {
     dav.ensure_root()?;
     let mut dirs: Vec<&str> = todo
         .iter()
-        .flat_map(|(e, _)| parent_dirs(&e.path))
+        .flat_map(|(entry, _)| parent_dirs(&entry.path))
         .collect();
     dirs.sort_unstable();
     dirs.dedup();
     for dir in dirs {
-        dav.mkcol(dir)?;
+        dav.create_dir(dir)?;
     }
 
     let display = Arc::new(Mutex::new(ProgressDisplay::new()));
+    let total = todo.len();
     for (index, (entry, _)) in todo.iter().enumerate() {
-        upload_file(&dav, &root, entry, index + 1, todo.len(), &display)?;
+        upload_file(dav.as_ref(), &root, &entry.path, index + 1, total, &display)?;
     }
+    finalize_push(dav.as_ref(), &root, &todo, total)
+}
 
-    // 部分服务器写入后不会立即出现在目录列表中，有限次数重新上传并复核。
-    let mut missing_paths = Vec::new();
-    for verify_round in 0..=VERIFY_RETRIES {
-        let remote_after = dav.list_recursive()?;
-        let stored: BTreeMap<&str, u64> = remote_after
-            .iter()
-            .map(|e| (e.path.as_str(), e.size))
-            .collect();
-        let mut missing = Vec::new();
-        for (index, item) in todo.iter().enumerate() {
-            let entry = item.0;
-            if stored.get(entry.path.as_str()) != Some(&entry.size) {
-                missing.push((index, entry));
-            }
-        }
-        missing_paths = missing.iter().map(|(_, e)| e.path.clone()).collect();
-        if missing.is_empty() {
-            break;
-        }
-        if verify_round == VERIFY_RETRIES {
-            break;
-        }
+/// 上传完成后回读一次远端列表，仅对已可见文件执行 mtime 对齐。
+/// 远端暂时不可见的文件不重传、不视为 push 失败，后续同步可继续处理。
+fn finalize_push(
+    dav: &dyn Backend,
+    root: &Path,
+    todo: &[(&Entry, Action)],
+    total: usize,
+) -> Result<()> {
+    let remote: BTreeMap<String, Entry> = dav
+        .list_recursive()?
+        .into_iter()
+        .filter(|e| !e.is_dir)
+        .map(|e| (e.path.clone(), e))
+        .collect();
 
-        println!(
-            "远端暂未确认 {} 个文件，{} 秒后重试上传（第 {}/{} 次）",
-            missing.len(),
-            1_u64 << verify_round,
-            verify_round + 1,
-            VERIFY_RETRIES
-        );
-        thread::sleep(Duration::from_millis(500 * (1_u64 << verify_round)));
-        for (index, entry) in missing {
-            upload_file(&dav, &root, entry, index + 1, todo.len(), &display)?;
-        }
-    }
-
-    if missing_paths.is_empty() {
-        println!("push 完成：更新 {} 个文件", todo.len());
-    } else {
-        for path in &missing_paths {
-            eprintln!(
-                "warning: 自动重试后服务器仍未保留 {path}（可能被服务端规则丢弃，后续 push 会继续补传）"
+    for (entry, _) in todo {
+        if let Some(remote) = remote.get(&entry.path)
+            && let Err(err) = align_local_mtime(root, entry, remote)
+        {
+            println!(
+                "告警：对齐 {} 的修改时间失败：{err}；下次 status 会显示该文件待拉取",
+                entry.path
             );
         }
-        println!(
-            "push 完成：更新 {} 个文件，其中 {} 个重试后仍未在远端确认",
-            todo.len(),
-            missing_paths.len()
-        );
     }
+    println!("push 完成：更新 {total} 个文件");
     Ok(())
+}
+
+/// 用回读的远端 mtime 对齐本地，避免 push 后立刻被判为「待拉取」。
+/// 三条守卫下静默跳过对齐，只有写入本身失败才返回 Err。
+fn align_local_mtime(root: &Path, local: &Entry, remote: &Entry) -> Result<()> {
+    // 远端没给可用时间（解析失败会降级成 0），对齐会把本地时间戳写成 1970
+    if remote.mtime <= 0 {
+        return Ok(());
+    }
+    // 远端的字节未必是我们刚传的那份（第三方并发覆盖、服务端截断）。保持本地较旧是对的：
+    // 此时的「待拉取」是真实状态，强行对齐会让对方的新内容再也拉不下来。
+    if remote.size != local.size {
+        return Ok(());
+    }
+    let target = root.join(&local.path);
+    let meta = fs::metadata(&target)
+        .with_context(|| format!("读取本地文件属性失败：{}", target.display()))?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // push 期间本地文件被改过：对齐会把新内容盖章成已同步，导致下次 push 跳过它
+    if meta.len() != local.size || mtime != local.mtime {
+        return Ok(());
+    }
+    set_local_mtime(&target, remote.mtime)
 }
 
 struct ProgressDisplay {
@@ -251,27 +301,31 @@ impl ProgressDisplay {
     }
 }
 
+/// 上传单个文件。
 fn upload_file(
-    dav: &WebDav,
+    dav: &dyn Backend,
     root: &Path,
-    entry: &Entry,
+    path: &str,
     index: usize,
     total_files: usize,
     display: &Arc<Mutex<ProgressDisplay>>,
 ) -> Result<()> {
-    let path = entry.path.clone();
-    let data = fs::read(root.join(&path)).with_context(|| format!("读取本地文件失败：{path}"))?;
+    let data = fs::read(root.join(path)).with_context(|| format!("读取本地文件失败：{path}"))?;
     let progress_display = Arc::clone(display);
-    let progress_path = path.clone();
-    let result = dav.put_with_progress(&path, &data, move |attempt, bytes, total| {
-        if let Ok(mut display) = progress_display.lock() {
-            display.update(index, total_files, &progress_path, attempt, bytes, total);
-        }
-    });
+    let progress_path = path.to_string();
+    let result = dav.upload(
+        path,
+        &data,
+        Arc::new(move |attempt, bytes, total| {
+            if let Ok(mut display) = progress_display.lock() {
+                display.update(index, total_files, &progress_path, attempt, bytes, total);
+            }
+        }),
+    );
     match result {
         Ok(attempt) => {
             if let Ok(mut display) = display.lock() {
-                display.finish(index, total_files, &path, attempt, data.len() as u64);
+                display.finish(index, total_files, path, attempt, data.len() as u64);
             }
             Ok(())
         }
@@ -295,29 +349,36 @@ fn parent_dirs(path: &str) -> Vec<&str> {
 }
 
 /// 下载到临时文件再原子替换，避免留下半写入的文件；并保留远端 mtime。
-fn download(dav: &WebDav, root: &Path, e: &Entry) -> Result<()> {
-    let data = dav.get(&e.path)?;
+fn download(dav: &dyn Backend, root: &Path, e: &Entry) -> Result<()> {
+    let data = if e.size == 0 {
+        Vec::new()
+    } else {
+        dav.download(&e.path)?
+    };
     let target = root.join(&e.path);
     let dir = target.parent().context("目标文件缺少父目录")?;
     fs::create_dir_all(dir)?;
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     tmp.write_all(&data)?;
     tmp.persist(&target).map_err(|err| err.error)?;
-    filetime::set_file_mtime(
-        &target,
-        filetime::FileTime::from_unix_time(e.mtime.max(0), 0),
-    )?;
-    Ok(())
+    set_local_mtime(&target, e.mtime)
 }
 
-fn connect_repo() -> Result<(PathBuf, WebDav)> {
+/// 把本地文件 mtime 写成给定的 Unix 秒。纳秒固定取 0，与 scan_local 的整秒口径
+/// 一致，两端因此严格相等，下次 plan() 必然判 Skip，而不是靠 TOLERANCE 兜。
+fn set_local_mtime(path: &Path, mtime: i64) -> Result<()> {
+    filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(mtime.max(0), 0))
+        .with_context(|| format!("写入文件修改时间失败：{}", path.display()))
+}
+
+fn connect_repo() -> Result<(PathBuf, Box<dyn Backend>)> {
     let dot = config::repo_dir()?;
     let cfg = config::load(&dot)?;
     let root = dot.parent().context("仓库目录缺少父目录")?.to_path_buf();
     Ok((root, connect(&cfg)?))
 }
 
-fn connect(cfg: &Config) -> Result<WebDav> {
+fn connect(cfg: &Config) -> Result<Box<dyn Backend>> {
     let r = &cfg.remote;
     if r.url.is_empty() {
         bail!("尚未配置远端仓库，请先运行 anysync config");
@@ -337,7 +398,7 @@ fn connect(cfg: &Config) -> Result<WebDav> {
         std::io::stdin().read_line(&mut line)?;
         line.trim().to_string()
     };
-    WebDav::new(&r.url, &r.root, &r.username, &password)
+    backend::connect(r, &password)
 }
 
 #[cfg(test)]
@@ -381,6 +442,13 @@ mod tests {
     }
 
     #[test]
+    fn newer_empty_source_transfers() {
+        let src = vec![e("a.txt", 200, 0)];
+        let dst = vec![e("a.txt", 100, 0)];
+        assert_eq!(plan(&src, &dst)[0].1, Action::Transfer);
+    }
+
+    #[test]
     fn same_time_different_size_conflicts() {
         let src = vec![e("a.txt", 100, 1)];
         let dst = vec![e("a.txt", 100, 2)];
@@ -406,7 +474,90 @@ mod tests {
     }
 
     #[test]
+    fn status_classifies_one_sided_and_conflicting_files() {
+        let local = vec![e("local.txt", 100, 1), e("conflict.txt", 100, 1)];
+        let remote = vec![e("remote.txt", 100, 1), e("conflict.txt", 100, 2)];
+
+        let push = plan(&local, &remote);
+        let pull = plan(&remote, &local);
+
+        assert_eq!(
+            push.iter()
+                .find(|(entry, _)| entry.path == "local.txt")
+                .map(|(_, action)| *action),
+            Some(Action::Transfer)
+        );
+        assert_eq!(
+            pull.iter()
+                .find(|(entry, _)| entry.path == "remote.txt")
+                .map(|(_, action)| *action),
+            Some(Action::Transfer)
+        );
+        assert_eq!(
+            push.iter()
+                .find(|(entry, _)| entry.path == "conflict.txt")
+                .map(|(_, action)| *action),
+            Some(Action::Conflict)
+        );
+    }
+
+    #[test]
     fn parent_dirs_are_ordered() {
         assert_eq!(parent_dirs("a/b/c.txt"), vec!["a/b", "a"]);
+    }
+
+    #[test]
+    fn mtime_roundtrip_closes_the_loop() {
+        // 钉住 push 后对齐的正确性依据：远端整秒 -> 写回 -> scan_local 读回，
+        // 三处口径一致则两值严格相等，plan() 双向都判 Skip。
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        fs::write(&file, b"hi").unwrap();
+
+        let remote_mtime = 1_758_551_527;
+        set_local_mtime(&file, remote_mtime).unwrap();
+
+        let local = scan_local(dir.path()).unwrap();
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].mtime, remote_mtime);
+
+        let remote = vec![e("a.txt", remote_mtime, local[0].size)];
+        assert_eq!(plan(&local, &remote)[0].1, Action::Skip);
+        assert_eq!(plan(&remote, &local)[0].1, Action::Skip);
+    }
+
+    #[test]
+    fn align_writes_remote_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"hi").unwrap();
+        let local = scan_local(dir.path()).unwrap().remove(0);
+
+        align_local_mtime(dir.path(), &local, &e("a.txt", 1_700_000_000, 2)).unwrap();
+
+        assert_eq!(scan_local(dir.path()).unwrap()[0].mtime, 1_700_000_000);
+    }
+
+    #[test]
+    fn align_skips_on_guards() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"hi").unwrap();
+        let local = scan_local(dir.path()).unwrap().remove(0);
+        let original = local.mtime;
+
+        // G1：远端时间不可用，不能把本地写成 1970
+        align_local_mtime(dir.path(), &local, &e("a.txt", 0, 2)).unwrap();
+        assert_eq!(scan_local(dir.path()).unwrap()[0].mtime, original);
+
+        // G2：远端字节不是我们传的那份，对齐会让对方的新内容再也拉不下来
+        align_local_mtime(dir.path(), &local, &e("a.txt", 1_700_000_000, 99)).unwrap();
+        assert_eq!(scan_local(dir.path()).unwrap()[0].mtime, original);
+
+        // G3：push 期间本地被改过，对齐会把新内容盖章成已同步
+        let stale = Entry {
+            mtime: original - 3600,
+            ..local.clone()
+        };
+        align_local_mtime(dir.path(), &stale, &e("a.txt", 1_700_000_000, 2)).unwrap();
+        assert_eq!(scan_local(dir.path()).unwrap()[0].mtime, original);
     }
 }

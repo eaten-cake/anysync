@@ -1,7 +1,7 @@
+mod backend;
 mod cli;
 mod config;
 mod sync;
-mod webdav;
 
 use anyhow::Result;
 use clap::Parser;
@@ -18,12 +18,14 @@ fn run() -> Result<()> {
     match cli::Cli::parse().command {
         Cmd::Init => config::init(),
         Cmd::Config {
+            backend,
             url,
             root,
             username,
             password,
-        } => config::remote_config(url, root, username, password),
+        } => config::remote_config(backend, url, root, username, password),
         Cmd::Pull => sync::pull(),
         Cmd::Push => sync::push(),
+        Cmd::Status => sync::status(),
     }
 }

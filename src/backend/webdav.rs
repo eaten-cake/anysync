@@ -1,3 +1,4 @@
+use super::{Backend, Entry, Progress, parse_endpoint};
 use anyhow::{Context, Result, anyhow, bail};
 use httpdate::parse_http_date;
 use percent_encoding::percent_decode_str;
@@ -7,15 +8,6 @@ use std::io::{self, Cursor, Read};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
-
-#[derive(Clone, Debug)]
-pub struct Entry {
-    /// 相对远端根目录的路径，以 / 分隔
-    pub path: String,
-    pub mtime: i64,
-    pub size: u64,
-    pub is_dir: bool,
-}
 
 const PROPFIND_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/><d:getlastmodified/><d:getcontentlength/></d:prop></d:propfind>"#;
@@ -35,7 +27,7 @@ pub struct WebDav {
 
 impl WebDav {
     pub fn new(url: &str, root: &str, username: &str, password: &str) -> Result<Self> {
-        let endpoint = Url::parse(url).with_context(|| format!("远端地址无效：{url}"))?;
+        let endpoint = parse_endpoint(url)?;
         let mut base = endpoint.clone();
         {
             let mut segments = base
@@ -113,7 +105,9 @@ impl WebDav {
         Ok(resp.bytes()?.to_vec())
     }
 
-    pub fn put_with_progress<F>(&self, rel: &str, data: &[u8], progress: F) -> Result<usize>
+    /// 上传单个文件，返回（成功时的尝试次数，服务端最终状态码）。
+    /// 状态码要带给调用方：服务端返回 2xx 却没保存时，它是唯一的诊断线索。
+    pub fn put_with_progress<F>(&self, rel: &str, data: &[u8], progress: F) -> Result<(usize, u16)>
     where
         F: Fn(usize, u64, u64) + Send + Sync + 'static,
     {
@@ -134,7 +128,10 @@ impl WebDav {
                 .body(Body::sized(reader, total))
                 .send()
             {
-                Ok(resp) if resp.status().is_success() => return Ok(attempt),
+                // 本函数不因文件暂未出现在远端列表而重传，仅处理明确的瞬时错误。
+                Ok(resp) if resp.status().is_success() => {
+                    return Ok((attempt, resp.status().as_u16()));
+                }
                 Ok(resp) => {
                     let status = resp.status();
                     if retry < MAX_RETRIES && is_retryable_status(status) {
@@ -148,11 +145,17 @@ impl WebDav {
                         http_hint(&status)
                     );
                 }
-                Err(err) if retry < MAX_RETRIES => {
+                // 仅连接阶段失败可确认请求未送达；其余传输错误的结果不确定，
+                // 不重传以避免在服务端已保存时产生副本。
+                Err(err) if retry < MAX_RETRIES && err.is_connect() => {
                     thread::sleep(retry_delay(retry));
-                    let _ = err;
                 }
-                Err(err) => return Err(err.into()),
+                Err(err) if err.is_connect() => {
+                    return Err(err).with_context(|| {
+                        format!("连续 {} 次连接服务器失败，未上传 {rel}", MAX_RETRIES + 1)
+                    });
+                }
+                Err(err) => bail!("上传结果不确定 {rel}：{err}；为避免产生同名副本，未自动重传"),
             }
         }
         unreachable!()
@@ -204,22 +207,21 @@ impl WebDav {
         Ok(files)
     }
 
-    /// Depth:1 列出单个目录。
-    fn list(&self, dir: &str) -> Result<Vec<Entry>> {
+    fn propfind(&self, rel: &str, depth: &str) -> Result<Vec<Entry>> {
         let method = Method::from_bytes(b"PROPFIND").expect("PROPFIND 是合法的 HTTP 方法");
         let resp = self.send_with_retry(|| {
-            self.req(method.clone(), self.url_for(dir))
-                .header("Depth", "1")
+            self.req(method.clone(), self.url_for(rel))
+                .header("Depth", depth)
                 .header("Content-Type", "application/xml")
                 .body(PROPFIND_BODY)
         })?;
         let status = resp.status();
         if status.as_u16() == 404 {
-            return Ok(Vec::new()); // 远端目录尚不存在
+            return Ok(Vec::new()); // 远端目录或文件尚不存在
         }
         if !status.is_success() {
             bail!(
-                "列出目录失败 {dir:?}：HTTP {}{}",
+                "列出目录失败 {rel:?}：HTTP {}{}",
                 status.as_u16(),
                 http_hint(&status)
             );
@@ -228,9 +230,39 @@ impl WebDav {
         let text = resp.text()?;
         // 排查服务器 quirks 用：ANYSYNC_DEBUG=1 anysync pull 2>debug.log
         if std::env::var_os("ANYSYNC_DEBUG").is_some() {
-            eprintln!("== PROPFIND {dir:?} ==\n{text}");
+            eprintln!("== PROPFIND {rel:?} Depth:{depth} ==\n{text}");
         }
         parse_multistatus(&text, &base_path)
+    }
+
+    /// Depth:1 列出单个目录。
+    fn list(&self, dir: &str) -> Result<Vec<Entry>> {
+        self.propfind(dir, "1")
+    }
+}
+
+impl Backend for WebDav {
+    fn list_recursive(&self) -> Result<Vec<Entry>> {
+        WebDav::list_recursive(self)
+    }
+
+    fn download(&self, path: &str) -> Result<Vec<u8>> {
+        self.get(path)
+    }
+
+    fn upload(&self, path: &str, data: &[u8], progress: Progress) -> Result<usize> {
+        self.put_with_progress(path, data, move |attempt, bytes, total| {
+            progress(attempt, bytes, total);
+        })
+        .map(|(attempt, _status)| attempt)
+    }
+
+    fn ensure_root(&self) -> Result<()> {
+        WebDav::ensure_root(self)
+    }
+
+    fn create_dir(&self, path: &str) -> Result<()> {
+        self.mkcol(path)
     }
 }
 
@@ -380,6 +412,76 @@ mod tests {
         assert!(is_retryable_status(StatusCode::INTERNAL_SERVER_ERROR));
         assert!(!is_retryable_status(StatusCode::UNAUTHORIZED));
         assert!(!is_retryable_status(StatusCode::NOT_FOUND));
+    }
+
+    #[test]
+    fn put_retries_explicit_transient_failures() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            for status in [500, 500, 201] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 1024];
+                let size = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..size]);
+                assert!(request.starts_with("PUT /file.txt HTTP/1.1"));
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .unwrap();
+            }
+        });
+
+        let attempts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&attempts);
+        let dav = WebDav::new(&format!("http://127.0.0.1:{port}"), "", "", "").unwrap();
+        assert_eq!(
+            dav.put_with_progress("file.txt", b"data", move |attempt, bytes, _| {
+                if bytes == 0 {
+                    observed.lock().unwrap().push(attempt);
+                }
+            })
+            .unwrap(),
+            (3, 201)
+        );
+        assert_eq!(*attempts.lock().unwrap(), vec![1, 2, 3]);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn successful_put_is_not_retried() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let size = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..size]);
+            assert!(request.starts_with("PUT /file.txt HTTP/1.1"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+
+        let dav = WebDav::new(&format!("http://127.0.0.1:{port}"), "", "", "").unwrap();
+        assert_eq!(
+            dav.put_with_progress("file.txt", b"data", |_, _, _| {})
+                .unwrap(),
+            (1, 201)
+        );
+        server.join().unwrap();
     }
 
     #[test]

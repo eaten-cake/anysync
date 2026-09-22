@@ -1,3 +1,4 @@
+use crate::config::Backend;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -17,7 +18,10 @@ pub enum Cmd {
     Init,
     /// 配置远端仓库
     Config {
-        /// WebDAV 地址
+        /// 存储后端
+        #[arg(long, value_enum)]
+        backend: Option<Backend>,
+        /// AList 服务地址或标准 WebDAV endpoint
         #[arg(long)]
         url: Option<String>,
         /// 远端根目录
@@ -34,4 +38,6 @@ pub enum Cmd {
     Pull,
     /// 推送本地较新的文件
     Push,
+    /// 查看本地与远端的同步状态
+    Status,
 }

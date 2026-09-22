@@ -1,3 +1,4 @@
+use crate::backend;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -10,8 +11,36 @@ pub struct Config {
     pub remote: Remote,
 }
 
+#[derive(Serialize, Deserialize, clap::ValueEnum, Default, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Backend {
+    Alist,
+    // 未指定后端的旧配置沿用原有 endpoint。
+    #[default]
+    Webdav,
+}
+
+impl Backend {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Alist => "alist",
+            Self::Webdav => "webdav",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "alist" => Ok(Self::Alist),
+            "webdav" => Ok(Self::Webdav),
+            _ => bail!("不支持的存储后端：{value}，请选择 alist 或 webdav"),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct Remote {
+    #[serde(default)]
+    pub backend: Backend,
     #[serde(default)]
     pub url: String,
     #[serde(default)]
@@ -20,6 +49,12 @@ pub struct Remote {
     pub username: String,
     #[serde(default)]
     pub password: String,
+}
+
+impl Remote {
+    pub fn endpoint(&self) -> Result<String> {
+        backend::endpoint(self.backend, &self.url)
+    }
 }
 
 /// 从当前目录向上查找 .anysync 目录，类似 git。
@@ -64,8 +99,9 @@ fn save(dot: &Path, cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-/// remote config：指定参数时只更新对应项，无参数时逐项交互询问。
+/// 指定参数时只更新对应项，无参数时逐项交互询问。
 pub fn remote_config(
+    backend: Option<Backend>,
     url: Option<String>,
     root: Option<String>,
     username: Option<String>,
@@ -73,16 +109,38 @@ pub fn remote_config(
 ) -> Result<()> {
     let dot = repo_dir()?;
     let mut remote = load(&dot)?.remote;
-    let interactive = url.is_none() && root.is_none() && username.is_none() && !ask_password;
+    let interactive =
+        backend.is_none() && url.is_none() && root.is_none() && username.is_none() && !ask_password;
 
     if interactive {
-        remote.url = ask("远程仓库地址", &remote.url)?;
-        remote.root = ask("根目录（追加到远程地址，如 test）", &remote.root)?;
-        remote.username = ask("用户名", &remote.username)?;
+        remote.backend =
+            Backend::parse(&ask("存储后端（alist / webdav）", remote.backend.as_str())?)?;
+        let label = match remote.backend {
+            Backend::Alist => "AList 服务地址（如 https://host，自动使用 /dav）",
+            Backend::Webdav => "WebDAV endpoint（如 https://host/remote.php/dav/files/user）",
+        };
+        remote.url = ask(label, &remote.url)?;
     } else {
+        if let Some(v) = backend {
+            remote.backend = v;
+        }
         if let Some(v) = url {
             remote.url = v;
         }
+    }
+    if !remote.url.is_empty() {
+        remote.url = remote.endpoint()?;
+    } else if interactive {
+        bail!("远端地址不能为空");
+    }
+    if interactive {
+        println!("WebDAV endpoint：{}", remote.url);
+        remote.root = ask(
+            "远端根目录（相对于 endpoint，如 /test；/ 表示根目录）",
+            &remote.root,
+        )?;
+        remote.username = ask("用户名", &remote.username)?;
+    } else {
         if let Some(v) = root {
             remote.root = v;
         }
@@ -111,7 +169,7 @@ fn prompt_password(label: &str) -> Result<String> {
         Ok(rpassword::read_password()?)
     } else {
         let mut line = String::new();
-        std::io::stdin().read_line(&mut line)?;
+        io::stdin().read_line(&mut line)?;
         Ok(line.trim().to_string())
     }
 }
@@ -130,4 +188,78 @@ fn ask(label: &str, current: &str) -> Result<String> {
     } else {
         value.to_string()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alist_uses_origin_and_dav_path() {
+        for address in [
+            "https://host:8443",
+            "https://host:8443/",
+            "https://host:8443/dav/",
+            "https://host:8443/some/path",
+        ] {
+            let remote = Remote {
+                backend: Backend::Alist,
+                url: address.into(),
+                root: "/test".into(),
+                ..Remote::default()
+            };
+            assert_eq!(remote.endpoint().unwrap(), "https://host:8443/dav");
+            assert_eq!(remote.root, "/test");
+        }
+    }
+
+    #[test]
+    fn webdav_preserves_custom_endpoint() {
+        let remote = Remote {
+            url: "https://host/remote.php/dav/files/user/".into(),
+            ..Remote::default()
+        };
+        assert_eq!(remote.endpoint().unwrap(), remote.url);
+    }
+
+    #[test]
+    fn legacy_config_defaults_to_webdav() {
+        let cfg: Config =
+            toml::from_str("[remote]\nurl = 'https://host/custom'\nroot = '/dav/test'").unwrap();
+        assert_eq!(cfg.remote.backend, Backend::Webdav);
+        assert_eq!(cfg.remote.endpoint().unwrap(), "https://host/custom");
+        assert_eq!(cfg.remote.root, "/dav/test");
+    }
+
+    #[test]
+    fn backend_config_roundtrips_and_rejects_unknown_values() {
+        let cfg: Config =
+            toml::from_str("[remote]\nbackend = 'alist'\nurl = 'http://host'").unwrap();
+        let saved = toml::to_string(&cfg).unwrap();
+        let loaded: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(loaded.remote.backend, Backend::Alist);
+        assert_eq!(loaded.remote.endpoint().unwrap(), "http://host/dav");
+        assert!(toml::from_str::<Config>("[remote]\nbackend = 'unknown'").is_err());
+        assert!(Backend::parse("unknown").is_err());
+    }
+
+    #[test]
+    fn endpoint_rejects_invalid_or_embedded_auth_urls() {
+        for backend in [Backend::Alist, Backend::Webdav] {
+            for address in [
+                "host",
+                "ftp://host/path",
+                "https://user:secret@host/path",
+                "https://host/path?token=secret",
+                "https://host/path#fragment",
+            ] {
+                let remote = Remote {
+                    backend,
+                    url: address.into(),
+                    ..Remote::default()
+                };
+                assert!(remote.endpoint().is_err());
+            }
+        }
+    }
 }
